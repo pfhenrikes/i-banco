@@ -18,6 +18,8 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #define COMANDO_DEBITAR "debitar"
 #define COMANDO_CREDITAR "creditar"
@@ -31,6 +33,9 @@
 #define OPERACAO_LER_SALDO 3
 #define OPERACAO_SAIR 4
 #define OPERACAO_TRANSFERIR 5
+#define OPERACAO_SAIR_AGORA 6
+#define OPERACAO_SIMULAR 7
+#define OPERACAO_LIGAR_PIPE 8
 
 #define FALSE 0
 #define TRUE 1
@@ -40,12 +45,18 @@
 #define BUFFER_SIZE 100
 #define NUM_TRABALHADORAS 3
 #define PEDIDO_BUFFER_DIM (NUM_TRABALHADORAS * 2)
+#define PIPENAME "i-banco-pipe"
+
+void tratarSignalPipe(int signal) {}
+
 
 typedef struct {
   int operacao;
   int idConta;
   int idConta2;
   int valor;
+  int numAnos;
+  int pipeID;
 } pedido_t;
 
 
@@ -56,8 +67,10 @@ void *threadFunc();
 int posColocar = 0;
 int posObter = 0;
 int countBuffer = 0;
+int client;
 
 char filename[50];
+char pipeNumber[50]; 
 
 pedido_t pedido_buffer[PEDIDO_BUFFER_DIM]; /* Tabela de pedidos */
 pthread_t threads[NUM_TRABALHADORAS]; /* Tarefas trabalhadoras */
@@ -67,16 +80,16 @@ pthread_cond_t podeSimular;
 
 int main(int argc, char** argv) {
 
-  char *args[MAXARGS + 1];
-  char buffer[BUFFER_SIZE];
   int numFilhos = 0;
   int pidTable[MAXFILHOS];
   int posPid;
   int i; /* Iterar ciclos */
-
+  int pipe;
+  
   pedido_t pedido;
 
   signal(SIGUSR1, tratarSignal);
+  signal(SIGPIPE, tratarSignalPipe);
 
   inicializarContas();
 
@@ -111,45 +124,59 @@ int main(int argc, char** argv) {
 
   /* Inicializar cond_t */
   if (pthread_cond_init(&podeSimular, NULL) != 0) {
-    fprintf(stderr, "Erro a incializar cond");
+    fprintf(stderr, "Erro a incializar cond\n");
     exit(EXIT_FAILURE);
   }
 
-  abrir_ficheiro();
+  abrir_ficheiro(); /*Abre o ficheiro log.txt*/
+  
+  unlink(PIPENAME);
+  
+  if (mkfifo(PIPENAME, 0666) < 0) {
+    fprintf(stderr, "Erro a criar o pipe.\n");
+    exit(-1);
+  }
+  
+  pipe = open(PIPENAME, O_RDONLY);
+  if (pipe == -1) {
+    fprintf(stderr, "Erro a abrir pipe.\n");
+    exit(-1);
+  }
+  
 /* ========================================================================== */
 
   printf("Bem-vinda/o ao i-banco\n\n");
 
   while (1) {
-    int numargs, status;
+    int status;
 
-    numargs = readLineArguments(args, MAXARGS + 1, buffer, BUFFER_SIZE);
+    read(pipe, &pedido, sizeof(pedido_t));
 
     /* EOF (end of file) do stdin ou comando "sair" */
-    if (numargs < 0 ||
-      (numargs > 0 && (strcmp(args[0], COMANDO_SAIR) == 0))) {
+    if (pedido.operacao == OPERACAO_SAIR) {
       int filho, pid;
       /* Sair normalmente */
-      if (numargs == 1 || numargs < 0) {
-        pedido_t pedido;
-        pedido.operacao = OPERACAO_SAIR;
-        for (i = 0; i < NUM_TRABALHADORAS; i++)
-          colocarPedido(pedido);
-        printf("i-banco vai terminar.\n--\n");
-        for (filho = 0; filho < numFilhos; filho++) {
-          pid = wait(&status);
-          printf("FILHO TERMINADO (PID=%d; terminou %s)\n", pid,
-            WIFSIGNALED(status) ? "abruptamente" : "normalmente");
+      for (i = 0; i < NUM_TRABALHADORAS; i++)
+        colocarPedido(pedido);
+      printf("i-banco vai terminar.\n--\n");
+      for (filho = 0; filho < numFilhos; filho++) {
+        pid = wait(&status);
+        printf("FILHO TERMINADO (PID=%d; terminou %s)\n", pid,
+          WIFSIGNALED(status) ? "abruptamente" : "normalmente");
+      }
+      for (i = 0; i < NUM_TRABALHADORAS; i++) {
+        if (pthread_join(threads[i], NULL) != 0)
+          fprintf(stderr, "Erro a sair da thread\n");
         }
-        for (i = 0; i < NUM_TRABALHADORAS; i++) {
-          if (pthread_join(threads[i], NULL) != 0)
-            fprintf(stderr, "Erro a sair da thread\n");
-        }
+        printf("--\ni-banco terminou.\n");
+        close(pipe);
+        unlink(PIPENAME);
+      	exit(EXIT_SUCCESS);
       }
 
       /* Sair Agora */
-      else if (numargs == 2 && strcmp(args[1], "agora") == 0) {
-        pedido_t pedido;
+      else if (pedido.operacao == OPERACAO_SAIR_AGORA) {
+        int filho, pid;
         pedido.operacao = OPERACAO_SAIR;
         for(i = 0; i < NUM_TRABALHADORAS; i++)
           colocarPedido(pedido);
@@ -167,90 +194,18 @@ int main(int argc, char** argv) {
           if (pthread_join(threads[i], NULL) != 0)
             fprintf(stderr, "Erro a sair da thread\n");
         }
-      }
-
-      else {
-        printf("%s: Sintaxe inválida, tente de novo.\n", COMANDO_SAIR);
-        continue;
-      }
-      printf("--\ni-banco terminou.\n");
-      exit(EXIT_SUCCESS);
-    }
-
-    else if (numargs == 0)
-      /* Nenhum argumento; ignora e volta a pedir */
-      continue;
-
-    /* Debitar */
-    else if (strcmp(args[0], COMANDO_DEBITAR) == 0) {
-
-      if (numargs < 3) {
-        printf("%s: Sintaxe inválida, tente de novo.\n", COMANDO_DEBITAR);
-        continue;
-      }
-
-      pedido.operacao = OPERACAO_DEBITAR;
-      pedido.idConta = atoi(args[1]);
-      pedido.valor = atoi(args[2]);
-
-      colocarPedido(pedido);
-    }
-
-    /* Creditar */
-    else if (strcmp(args[0], COMANDO_CREDITAR) == 0) {
-
-      if (numargs < 3) {
-        printf("%s: Sintaxe inválida, tente de novo.\n", COMANDO_CREDITAR);
-        continue;
-      }
-
-      pedido.operacao = OPERACAO_CREDITAR;
-      pedido.idConta = atoi(args[1]);
-      pedido.valor = atoi(args[2]);
-
-      colocarPedido(pedido);
-    }
-
-    /* Transferir */
-    else if (strcmp(args[0], COMANDO_TRANSFERIR) == 0) {
-
-      if (numargs < 4 || atoi(args[1]) == atoi(args[2])) {
-        printf("%s: Sintaxe inválida, tente de novo.\n", COMANDO_TRANSFERIR);
-        continue;
-      }
-
-      pedido.operacao = OPERACAO_TRANSFERIR;
-      pedido.idConta = atoi(args[1]);
-      pedido.idConta2 = atoi(args[2]);
-      pedido.valor = atoi(args[3]);
-
-      colocarPedido(pedido);
-    }
-
-    /* Ler Saldo */
-    else if (strcmp(args[0], COMANDO_LER_SALDO) == 0) {
-
-      if (numargs < 2) {
-        printf("%s: Sintaxe inválida, tente de novo.\n", COMANDO_LER_SALDO);
-        continue;
-      }
-
-      pedido.operacao = OPERACAO_LER_SALDO;
-      pedido.idConta = atoi(args[1]);
-      pedido.valor = 0;
-
-      colocarPedido(pedido);
-    }
+      
+      	printf("--\ni-banco terminou.\n");
+      	close(pipe);
+      	unlink(PIPENAME);
+      	exit(EXIT_SUCCESS);
+ 	}
 
     /* Simular */
-    else if (strcmp(args[0], COMANDO_SIMULAR) == 0) {
+    else if (pedido.operacao == OPERACAO_SIMULAR) {
       int numAnos, pid, file_simular;
 
-      if (numargs < 2) {
-        printf("%s: Sintaxe inválida, tente de novo.\n", COMANDO_SIMULAR);
-        continue;
-      }
-      numAnos = atoi(args[1]);
+      numAnos = pedido.numAnos;
 
       if (numFilhos < MAXFILHOS){
         if(pthread_mutex_lock(&mutexSimular) != 0)
@@ -290,9 +245,10 @@ int main(int argc, char** argv) {
 
     /* Caso nenhum comando funcione */
     else {
-      printf("Comando desconhecido. Tente de novo.\n");
+      colocarPedido(pedido);
       continue;
     }
+    close(client);
   }
 }
 
@@ -346,29 +302,39 @@ pedido_t obterPedido() {
 }
 
 void *threadFunc() {
+  int res, client;
 
   while(TRUE) {
     pedido_t p = obterPedido();
 
+    sprintf(pipeNumber, "pipe-%d", p.pipeID);
+  	client = open(pipeNumber, O_WRONLY);
+
     if (p.operacao == OPERACAO_DEBITAR) {
-      debitar(p.idConta, p.valor);
+      res = debitar(p.idConta, p.valor);
+      write(client, &res, sizeof(res));
     }
 
     else if (p.operacao == OPERACAO_CREDITAR) {
-      creditar(p.idConta, p.valor);
+      res = creditar(p.idConta, p.valor);
+      write(client, &res, sizeof(res));
    	}
 
     else if (p.operacao == OPERACAO_LER_SALDO) {
-      lerSaldo(p.idConta);
+      res = lerSaldo(p.idConta);
+      write(client, &res, sizeof(res));
     }
 
     else if (p.operacao == OPERACAO_TRANSFERIR) {
-      transferir(p.idConta, p.idConta2, p.valor);
+      res = transferir(p.idConta, p.idConta2, p.valor);
+      write(client, &res, sizeof(res));
     }
 
     else if (p.operacao == OPERACAO_SAIR)
       return NULL;
-
+    
+    close(client);    
+    
     if(pthread_mutex_lock(&mutexSimular) != 0)
       fprintf(stderr, "Erro fechar mutex");
     countBuffer--;
@@ -379,3 +345,4 @@ void *threadFunc() {
       fprintf(stderr, "Erro abrir mutex");
   }
 }
+
