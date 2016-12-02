@@ -116,7 +116,7 @@ int lerSaldo(int idConta) {
       return -1;
    }
    saldo = contasSaldos[idConta - 1];
-   sprintf(message, "%lu: %s(%d): OK.\n\n", pthread_self(), COMANDO_LER_SALDO, idConta);
+   sprintf(message, "%lu: %s(%d): O saldo da conta é %d.\n\n", pthread_self(), COMANDO_LER_SALDO, idConta, saldo);
    write(ficheiro, &message, strlen(message));
    unlock_conta(idConta);
    return saldo;
